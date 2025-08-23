@@ -3,10 +3,12 @@ from typing import Dict, Any
 import requests
 import redis
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
+# -------- env --------
 REDIS_URL = os.getenv("REDIS_URL", "")
 AGENT_API_KEY = os.getenv("AGENT_API_KEY", "")
+
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 RENDER_AGENT_DEPLOY_HOOK = os.getenv("RENDER_AGENT_DEPLOY_HOOK", os.getenv("RENDER_DEPLOY_HOOK", ""))
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -43,7 +45,7 @@ def require_auth(request: Request):
     if token != AGENT_API_KEY:
         raise HTTPException(status_code=403, detail="invalid token")
 
-# ---------------- Cloud processors ----------------
+# -------- processors (cloud) --------
 def do_github_dispatch(payload: Dict[str, Any]):
     if not GITHUB_TOKEN:
         raise RuntimeError("GITHUB_TOKEN missing")
@@ -51,9 +53,11 @@ def do_github_dispatch(payload: Dict[str, Any]):
     repo  = payload.get("repo", "TAAI-Automation-agent")
     evt   = payload.get("event_type", "smoke-now")
     url   = f"https://api.github.com/repos/{owner}/{repo}/dispatches"
-    hdrs  = {"Authorization": f"token {GITHUB_TOKEN}",
-             "Accept": "application/vnd.github+json",
-             "User-Agent": "taai-agent-hub"}
+    hdrs  = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "taai-agent-hub"
+    }
     body = {"event_type": evt}
     resp = requests.post(url, headers=hdrs, json=body, timeout=15)
     log(f"[GH] {owner}/{repo} dispatch '{evt}' → {resp.status_code}")
@@ -127,7 +131,7 @@ def worker_loop():
 
 threading.Thread(target=worker_loop, daemon=True).start()
 
-# ---------------- HTTP API ----------------
+# -------- HTTP API --------
 @app.get("/healthz")
 def healthz():
     return {"ok": True, "service": "agent-hub"}
@@ -136,10 +140,8 @@ def healthz():
 def get_queue():
     items_cloud = r.lrange(QUEUE_CLOUD, 0, 200)
     items_local = r.lrange(QUEUE_LOCAL, 0, 200)
-    return {
-        "cloud": [json.loads(x) for x in items_cloud],
-        "local": [json.loads(x) for x in items_local],
-    }
+    return {"cloud": [json.loads(x) for x in items_cloud],
+            "local": [json.loads(x) for x in items_local]}
 
 @app.get("/api/logs")
 def get_logs():
@@ -178,7 +180,7 @@ async def runner_poll(request: Request):
     require_auth(request)
     body = await request.json()
     runner = (body.get("runner") or "unknown").strip()
-    item = r.brpop(QUEUE_LOCAL, timeout=20)
+    item = r.brpop(QUEUE_LOCAL, timeout=15)
     if not item:
         return {"ok": True, "task": None}
     _, raw = item
@@ -197,25 +199,23 @@ def dashboard():
   body{font-family:system-ui,Segoe UI,Arial;margin:20px}
   .row{display:flex;gap:16px;flex-wrap:wrap}
   .card{border:1px solid #ddd;border-radius:12px;padding:16px;flex:1;min-width:320px;box-shadow:0 1px 4px rgba(0,0,0,.06)}
+  button{padding:8px 12px;border-radius:10px;border:1px solid #ccc;cursor:pointer}
+  textarea,input{width:100%;padding:8px;border-radius:8px;border:1px solid #ccc}
   pre{white-space:pre-wrap;max-height:420px;overflow:auto}
   small{color:#666}
 </style>
 <h2>🧠 TAAI Agent Hub</h2>
 <p><small>Cloud queue + Local runner queue</small></p>
 <div class="row">
-  <div class="card"><h3>Queues</h3><pre id="queue"></pre></div>
+  <div class="card"><h3>Queue</h3><pre id="queue"></pre></div>
   <div class="card"><h3>Logs</h3><pre id="logs"></pre></div>
 </div>
 <script>
 async function load(){
-  try{
-    const q = await (await fetch('/queue')).json();
-    document.getElementById('queue').innerText = JSON.stringify(q, null, 2);
-  }catch(e){}
-  try{
-    const l = await (await fetch('/api/logs')).json();
-    document.getElementById('logs').innerText = (l.lines||[]).join('\\n');
-  }catch(e){}
+  try{ const q = await (await fetch('/queue')).json();
+        document.getElementById('queue').innerText = JSON.stringify(q, null, 2); }catch(e){}
+  try{ const l = await (await fetch('/api/logs')).json();
+        document.getElementById('logs').innerText = (l.lines||[]).join('\\n'); }catch(e){}
 }
 setInterval(load, 1500); load();
 </script>
