@@ -3,8 +3,5 @@ services:
     name: taai-agent-hub
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn app.main:app --host 0.0.0.0 --port 10000
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
     plan: free
-    envVars:
-      - key: PORT
-        value: "10000"
