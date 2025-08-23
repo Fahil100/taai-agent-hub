@@ -3,7 +3,7 @@ from typing import Dict, Any
 import requests
 import redis
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.responses import HTMLResponse
 
 REDIS_URL = os.getenv("REDIS_URL", "")
 AGENT_API_KEY = os.getenv("AGENT_API_KEY", "")
@@ -11,13 +11,12 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 RENDER_AGENT_DEPLOY_HOOK = os.getenv("RENDER_AGENT_DEPLOY_HOOK", os.getenv("RENDER_DEPLOY_HOOK", ""))
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 ALLOW_SHELL = os.getenv("ALLOW_SHELL", "false").lower() == "true"
 
-QUEUE_KEY = "queue:tasks"
-LOGS_KEY  = "logs:lines"
-MAX_LOGS  = 2000
+QUEUE_CLOUD = "queue:tasks"   # cloud worker (GitHub/Render/HTTP/Telegram)
+QUEUE_LOCAL = "queue:local"   # pulled by your local runner
+LOGS_KEY    = "logs:lines"
+MAX_LOGS    = 2000
 
 if not REDIS_URL:
     raise RuntimeError("REDIS_URL not set")
@@ -44,6 +43,7 @@ def require_auth(request: Request):
     if token != AGENT_API_KEY:
         raise HTTPException(status_code=403, detail="invalid token")
 
+# ---------------- Cloud processors ----------------
 def do_github_dispatch(payload: Dict[str, Any]):
     if not GITHUB_TOKEN:
         raise RuntimeError("GITHUB_TOKEN missing")
@@ -51,11 +51,9 @@ def do_github_dispatch(payload: Dict[str, Any]):
     repo  = payload.get("repo", "TAAI-Automation-agent")
     evt   = payload.get("event_type", "smoke-now")
     url   = f"https://api.github.com/repos/{owner}/{repo}/dispatches"
-    hdrs  = {
-        "Authorization": f"token {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github+json",
-        "User-Agent": "taai-agent-hub"
-    }
+    hdrs  = {"Authorization": f"token {GITHUB_TOKEN}",
+             "Accept": "application/vnd.github+json",
+             "User-Agent": "taai-agent-hub"}
     body = {"event_type": evt}
     resp = requests.post(url, headers=hdrs, json=body, timeout=15)
     log(f"[GH] {owner}/{repo} dispatch '{evt}' → {resp.status_code}")
@@ -110,7 +108,7 @@ def worker_loop():
     log("[WORKER] started")
     while True:
         try:
-            item = r.brpop(QUEUE_KEY, timeout=5)
+            item = r.brpop(QUEUE_CLOUD, timeout=5)
             if not item:
                 continue
             _, raw = item
@@ -129,14 +127,19 @@ def worker_loop():
 
 threading.Thread(target=worker_loop, daemon=True).start()
 
+# ---------------- HTTP API ----------------
 @app.get("/healthz")
 def healthz():
     return {"ok": True, "service": "agent-hub"}
 
 @app.get("/queue")
 def get_queue():
-    items = r.lrange(QUEUE_KEY, 0, 200)
-    return [json.loads(x) for x in items]
+    items_cloud = r.lrange(QUEUE_CLOUD, 0, 200)
+    items_local = r.lrange(QUEUE_LOCAL, 0, 200)
+    return {
+        "cloud": [json.loads(x) for x in items_cloud],
+        "local": [json.loads(x) for x in items_local],
+    }
 
 @app.get("/api/logs")
 def get_logs():
@@ -152,64 +155,39 @@ async def enqueue(request: Request):
         raise HTTPException(status_code=400, detail="missing type or payload")
     t_id = uuid.uuid4().hex[:8]
     item = {"id": t_id, "type": t_type, "payload": payload}
-    r.lpush(QUEUE_KEY, json.dumps(item))
-    log(f"[ENQ] {t_type} id={t_id}")
+    r.lpush(QUEUE_CLOUD, json.dumps(item))
+    log(f"[ENQ][CLOUD] {t_type} id={t_id}")
     return {"ok": True, "id": t_id}
 
-@app.post("/telegram/webhook/{secret}")
-async def telegram_webhook(secret: str, request: Request):
-    if TELEGRAM_WEBHOOK_SECRET and secret != TELEGRAM_WEBHOOK_SECRET:
-        raise HTTPException(status_code=403, detail="bad secret")
-    upd = await request.json()
-    msg = (((upd.get("message") or {}).get("text")) or "").strip().lower()
-    if not msg:
-        return {"ok": True}
-    if "deploy" in msg:
-        r.lpush(QUEUE_KEY, json.dumps({"id": uuid.uuid4().hex[:8], "type":"github.dispatch",
-                                       "payload":{"owner":"Fahil100","repo":"TAAI-Automation-agent","event_type":"smoke-now"}}))
-        r.lpush(QUEUE_KEY, json.dumps({"id": uuid.uuid4().hex[:8], "type":"render.deploy","payload":{}}))
-        if TELEGRAM_CHAT_ID:
-            do_telegram_send({"text":"Queued deploy via Telegram ✅"})
-    elif "health" in msg or "ping" in msg:
-        r.lpush(QUEUE_KEY, json.dumps({"id": uuid.uuid4().hex[:8], "type":"http.request",
-                                       "payload":{"method":"GET","url":"https://taai-automation-agent.onrender.com/healthz"}}))
-    else:
-        if TELEGRAM_CHAT_ID:
-            do_telegram_send({"text":"Commands: deploy | health"})
-    return {"ok": True}
+@app.post("/enqueue-local")
+async def enqueue_local(request: Request):
+    require_auth(request)
+    body = await request.json()
+    t_type = body.get("type")
+    payload = body.get("payload")
+    if not t_type or payload is None:
+        raise HTTPException(status_code=400, detail="missing type or payload")
+    t_id = uuid.uuid4().hex[:8]
+    item = {"id": t_id, "type": t_type, "payload": payload}
+    r.lpush(QUEUE_LOCAL, json.dumps(item))
+    log(f"[ENQ][LOCAL] {t_type} id={t_id}")
+    return {"ok": True, "id": t_id}
 
-@app.post("/chat")
-async def chat(request: Request):
-    data = await request.json()
-    user = data.get("message","").strip()
-    if not user:
-        return {"reply":"(empty)"}
-    if OPENAI_API_KEY:
-        try:
-            from openai import OpenAI
-            client = OpenAI(api_key=OPENAI_API_KEY)
-            resp = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role":"system","content":"You are TAAI ops agent. Keep replies short."},
-                          {"role":"user","content":user}]
-            )
-            text = resp.choices[0].message.content
-        except Exception as e:
-            text = f"(LLM error: {e})"
-    else:
-        text = "(LLM not configured) You can still click quick actions."
-
-    lower = user.lower()
-    if "deploy" in lower:
-        r.lpush(QUEUE_KEY, json.dumps({"id": uuid.uuid4().hex[:8], "type":"github.dispatch",
-                                       "payload":{"owner":"Fahil100","repo":"TAAI-Automation-agent","event_type":"smoke-now"}}))
-        r.lpush(QUEUE_KEY, json.dumps({"id": uuid.uuid4().hex[:8], "type":"render.deploy","payload":{}}))
-        log("[CHAT] queued deploy")
-    if "health" in lower or "ping" in lower:
-        r.lpush(QUEUE_KEY, json.dumps({"id": uuid.uuid4().hex[:8], "type":"http.request",
-                                       "payload":{"method":"GET","url":"https://taai-automation-agent.onrender.com/healthz"}}))
-        log("[CHAT] queued health")
-    return {"reply": text}
+@app.post("/runner/poll")
+async def runner_poll(request: Request):
+    require_auth(request)
+    body = await request.json()
+    runner = (body.get("runner") or "unknown").strip()
+    item = r.brpop(QUEUE_LOCAL, timeout=20)
+    if not item:
+        return {"ok": True, "task": None}
+    _, raw = item
+    try:
+        task = json.loads(raw)
+    except Exception:
+        task = {"raw": raw}
+    log(f"[RUNNER][{runner}] pulled {task.get('type') or 'unknown'}")
+    return {"ok": True, "task": task}
 
 @app.get("/")
 def dashboard():
@@ -219,38 +197,16 @@ def dashboard():
   body{font-family:system-ui,Segoe UI,Arial;margin:20px}
   .row{display:flex;gap:16px;flex-wrap:wrap}
   .card{border:1px solid #ddd;border-radius:12px;padding:16px;flex:1;min-width:320px;box-shadow:0 1px 4px rgba(0,0,0,.06)}
-  button{padding:8px 12px;border-radius:10px;border:1px solid #ccc;cursor:pointer}
-  textarea,input{width:100%;padding:8px;border-radius:8px;border:1px solid #ccc}
   pre{white-space:pre-wrap;max-height:420px;overflow:auto}
   small{color:#666}
 </style>
 <h2>🧠 TAAI Agent Hub</h2>
+<p><small>Cloud queue + Local runner queue</small></p>
 <div class="row">
-  <div class="card">
-    <h3>Chat</h3>
-    <textarea id="msg" rows="3" placeholder="Try: deploy | health"></textarea><br/><br/>
-    <button onclick="send()">Send</button>
-    <p id="reply"><small>Reply will appear here…</small></p>
-  </div>
-  <div class="card">
-    <h3>Quick actions</h3>
-    <button onclick="enqueue('github.dispatch', {owner:'Fahil100',repo:'TAAI-Automation-agent',event_type:'smoke-now'})">GitHub smoke</button>
-    <button onclick="enqueue('render.deploy', {})">Render deploy</button>
-    <button onclick="enqueue('http.request', {method:'GET',url:'https://taai-automation-agent.onrender.com/healthz'})">Ping health</button>
-    <button onclick="enqueue('telegram.send', {text:'TAAI: hello from dashboard'})">Telegram ping</button>
-    <p><small>/enqueue is protected with Bearer token. Use CLI/Postman to call it.</small></p>
-  </div>
-</div>
-<div class="row">
-  <div class="card"><h3>Queue</h3><pre id="queue"></pre></div>
+  <div class="card"><h3>Queues</h3><pre id="queue"></pre></div>
   <div class="card"><h3>Logs</h3><pre id="logs"></pre></div>
 </div>
 <script>
-async function send(){
-  const r = await fetch('/chat',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({message:document.getElementById('msg').value})});
-  const j = await r.json(); document.getElementById('reply').innerText = j.reply || '(no reply)';
-}
 async function load(){
   try{
     const q = await (await fetch('/queue')).json();
@@ -260,9 +216,6 @@ async function load(){
     const l = await (await fetch('/api/logs')).json();
     document.getElementById('logs').innerText = (l.lines||[]).join('\\n');
   }catch(e){}
-}
-async function enqueue(type, payload){
-  alert('Use CLI/Postman to call /enqueue with your Bearer token.');
 }
 setInterval(load, 1500); load();
 </script>
