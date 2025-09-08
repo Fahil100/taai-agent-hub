@@ -58,3 +58,10 @@ def dashboard():
     </script>
     """
     return HTMLResponse(html)
+import os
+
+# make sure OPENAI_API_KEY is loaded
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+
+if not OPENAI_API_KEY:
+    print("WARNING: OPENAI_API_KEY is not set in environment")
