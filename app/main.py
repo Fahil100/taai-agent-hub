@@ -1,5 +1,9 @@
-from fastapi import Request
+from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
+
+app = FastAPI()
+
+OPENAI_API_KEY = ""  # Make sure this is set by env var in Render
 
 @app.post("/chat")
 async def chat(request: Request):
