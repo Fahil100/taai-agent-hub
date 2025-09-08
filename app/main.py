@@ -1,7 +1,6 @@
-# --- ADD BELOW YOUR EXISTING IMPORTS ---
 from fastapi import Request
+from fastapi.responses import HTMLResponse
 
-# --- ADD THIS CHAT ENDPOINT SOMEWHERE AFTER /enqueue ---
 @app.post("/chat")
 async def chat(request: Request):
     data = await request.json()
@@ -27,22 +26,31 @@ async def chat(request: Request):
 
     return {"reply": reply}
 
-# --- IN YOUR DASHBOARD HTML (inside @app.get("/")), INSERT THIS CARD ---
-<div class="card">
-  <h3>Chat</h3>
-  <textarea id="msg" rows="3" placeholder="Say something..."></textarea><br/><br/>
-  <button onclick="sendChat()">Send</button>
-  <p id="reply"><small>Reply will appear here...</small></p>
-</div>
-<script>
-async function sendChat(){
-  const msg = document.getElementById('msg').value;
-  const r = await fetch('/chat',{
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({message:msg})
-  });
-  const j = await r.json();
-  document.getElementById('reply').innerText = j.reply;
-}
-</script>
+@app.get("/")
+def dashboard():
+    html = """
+    <!doctype html>
+    <meta charset="utf-8"/>
+    <title>TAAI Agent Hub</title>
+
+    <div class="card">
+      <h3>Chat</h3>
+      <textarea id="msg" rows="3" placeholder="Say something..."></textarea><br/><br/>
+      <button onclick="sendChat()">Send</button>
+      <p id="reply"><small>Reply will appear here...</small></p>
+    </div>
+
+    <script>
+    async function sendChat(){
+      const msg = document.getElementById('msg').value;
+      const r = await fetch('/chat',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({message:msg})
+      });
+      const j = await r.json();
+      document.getElementById('reply').innerText = j.reply;
+    }
+    </script>
+    """
+    return HTMLResponse(html)
