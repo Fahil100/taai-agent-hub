@@ -32,7 +32,7 @@ async def chat(request: Request):
   <h3>Chat</h3>
   <textarea id="msg" rows="3" placeholder="Say something..."></textarea><br/><br/>
   <button onclick="sendChat()">Send</button>
-  <p id="reply"><small>Reply will appear here…</small></p>
+  <p id="reply"><small>Reply will appear here...</small></p>
 </div>
 <script>
 async function sendChat(){
